@@ -1,34 +1,45 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iostream>
 #include <chrono>
 #include <thread>
-// Function to capture the screen and save it as a bitmap file
-#include <Windows.h>
-#include <iostream>
-void CaptureScreen(const char* filePath) {
-    HDESK hInputDesktop = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-    if (!hInputDesktop) {
-        std::cerr << "OpenInputDesktop failed: " << GetLastError() << std::endl;
-        return;
+
+// Link with Ws2_32.lib and Gdi32.lib
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Gdi32.lib")
+
+#define SERVER_PORT 12345
+#define SERVER_IP "127.0.0.1"
+
+// Function to send bitmap data to the server
+bool SendBitmapData(SOCKET clientSocket, const BYTE* data, int dataSize) {
+    int bytesSent = 0;
+    while (bytesSent < dataSize) {
+        int result = send(clientSocket, reinterpret_cast<const char*>(data + bytesSent), dataSize - bytesSent, 0);
+        if (result == SOCKET_ERROR) {
+            std::cerr << "Send failed with error: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+        bytesSent += result;
     }
-    if (!SetThreadDesktop(hInputDesktop)) {
-        std::cerr << "SetThreadDesktop failed: " << GetLastError() << std::endl;
-        CloseDesktop(hInputDesktop);
-        return;
-    }
+    return true;
+}
+
+void CaptureScreen(SOCKET clientSocket) {
     HDC hScreenDC = GetDC(NULL);
     if (!hScreenDC) {
         std::cerr << "GetDC failed: " << GetLastError() << std::endl;
-        CloseDesktop(hInputDesktop);
         return;
     }
+
     HDC hMemoryDC = CreateCompatibleDC(hScreenDC);
     if (!hMemoryDC) {
         std::cerr << "CreateCompatibleDC failed: " << GetLastError() << std::endl;
         ReleaseDC(NULL, hScreenDC);
-        CloseDesktop(hInputDesktop);
         return;
     }
+
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, screenWidth, screenHeight);
@@ -36,9 +47,9 @@ void CaptureScreen(const char* filePath) {
         std::cerr << "CreateCompatibleBitmap failed: " << GetLastError() << std::endl;
         DeleteDC(hMemoryDC);
         ReleaseDC(NULL, hScreenDC);
-        CloseDesktop(hInputDesktop);
         return;
     }
+
     HGDIOBJ hOldBitmap = SelectObject(hMemoryDC, hBitmap);
     if (!BitBlt(hMemoryDC, 0, 0, screenWidth, screenHeight, hScreenDC, 0, 0, SRCCOPY)) {
         std::cerr << "BitBlt failed: " << GetLastError() << std::endl;
@@ -46,13 +57,13 @@ void CaptureScreen(const char* filePath) {
         DeleteObject(hBitmap);
         DeleteDC(hMemoryDC);
         ReleaseDC(NULL, hScreenDC);
-        CloseDesktop(hInputDesktop);
         return;
     }
+
     BITMAPINFOHEADER bi = { 0 };
     bi.biSize = sizeof(BITMAPINFOHEADER);
     bi.biWidth = screenWidth;
-    bi.biHeight = -screenHeight; // Negative to indicate a top-down DIB
+    bi.biHeight = -screenHeight;
     bi.biPlanes = 1;
     bi.biBitCount = 32;
     bi.biCompression = BI_RGB;
@@ -65,38 +76,66 @@ void CaptureScreen(const char* filePath) {
         DeleteObject(hBitmap);
         DeleteDC(hMemoryDC);
         ReleaseDC(NULL, hScreenDC);
-        CloseDesktop(hInputDesktop);
         return;
     }
-    // Create a file to save the bitmap
-    HANDLE hFile = CreateFileA(filePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        // Create a BITMAPFILEHEADER structure to hold the file header
-        BITMAPFILEHEADER bf = { 0 };
-        bf.bfType = 0x4D42; // 'BM'
-        bf.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-        bf.bfSize = bf.bfOffBits + dataSize;
-        // Write the file header and the bitmap data to the file
-        DWORD written;
-        WriteFile(hFile, &bf, sizeof(bf), &written, NULL);
-        WriteFile(hFile, &bi, sizeof(bi), &written, NULL);
-        WriteFile(hFile, pData, dataSize, &written, NULL);
-        CloseHandle(hFile);
-    }
+
+    BITMAPFILEHEADER bfh;
+    memset(&bfh, 0, sizeof(bfh));
+    bfh.bfType = 0x4D42; // 'BM'
+    bfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    bfh.bfSize = bfh.bfOffBits + dataSize;
+
+    send(clientSocket, reinterpret_cast<const char*>(&bfh), sizeof(bfh), 0);
+    send(clientSocket, reinterpret_cast<const char*>(&bi), sizeof(bi), 0);
+    SendBitmapData(clientSocket, pData, dataSize);
+
     delete[] pData;
     SelectObject(hMemoryDC, hOldBitmap);
     DeleteObject(hBitmap);
     DeleteDC(hMemoryDC);
     ReleaseDC(NULL, hScreenDC);
-    CloseDesktop(hInputDesktop);
 }
+
+// Function to capture the entire screen and send data to Electron
 int main() {
-    int captureCount = 0;
-    while (true) {
-        std::string filePath = "C:\\screenshot\\screenshot_" + std::to_string(captureCount) + ".bmp";
-        std::cout << "Screenshot saved as " << filePath << std::endl;
-        CaptureScreen(filePath.c_str());
-        captureCount++;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    WSADATA wsaData;
+    SOCKET clientSocket = INVALID_SOCKET;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return 1;
     }
+
+    clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (clientSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed" << std::endl;
+        WSACleanup();
+        return 1;
+    }
+
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(SERVER_PORT);
+    if (inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr) <= 0) {
+        std::cerr << "Invalid IP address" << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    if (connect(clientSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "Connect failed with error: " << WSAGetLastError() << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    while (true) {
+        CaptureScreen(clientSocket);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    closesocket(clientSocket);
+    WSACleanup();
+    return 0;
 }
